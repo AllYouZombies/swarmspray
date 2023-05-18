@@ -1,0 +1,5 @@
+timezone: "Asia/Tashkent"
+domain: "anttek.io"
+storage_device: "/dev/vda"
+first_partition_size: 20 # GiB
+local_network: "172.16.16.0/24" # 0.0.0.0/0 for public access

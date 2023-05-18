@@ -1,0 +1,218 @@
+---
+- hosts: all
+  name: Prepare the system
+  become: yes
+  tasks:
+    - name: Get the root partition size
+      shell: |
+        df -h | grep -w / | awk '{print $2}' | cut -d'G' -f1
+      register: root_partition_size
+
+    - name: Install kexec-tools
+      apt:
+        name: kexec-tools
+        state: latest
+        update_cache: true
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Shrink the root partition
+      shell: |
+        mkdir -p /tmp/init
+        unmkinitramfs /boot/initrd.img-$(uname -r) /tmp/init/
+        cp $(which fdisk) $(which resize2fs) $(which e2fsck) $(which mkfs.ext4) /tmp/init/main/bin
+        cat << EOF > /tmp/init/main/usr/bin/shrink.sh
+        #!/bin/sh
+        e2fsck -fy $(findmnt --noheadings / | awk '{print $2}')
+        resize2fs {{ storage_device }}1 {{ first_partition_size }}G
+        EOF
+        sudo chmod +x /tmp/init/main/usr/bin/shrink.sh
+        sed -i '/^maybe_break premount/i /usr/bin/shrink.sh' /tmp/init/main/init
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Regenerate and boot into the new initrd image
+      shell: |
+        cd /tmp/init/main
+        find . | LC_ALL=C sort | cpio --quiet -R 0:0 -o -H newc > /tmp/shrink-initrd.img
+        kexec -l /boot/vmlinuz-$(uname -r) --initrd=/tmp/shrink-initrd.img --reuse-cmdline
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Reboot the system
+      reboot:
+        msg: "Reboot initiated by Ansible"
+        reboot_timeout: 3600
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Set a new partition size
+      shell: |
+        tee /tmp/parted.txt <<EOF
+        #!/bin/sh
+
+        (
+        echo d
+        echo n
+        echo p
+        echo
+        echo
+        echo +{{ first_partition_size }}G
+        echo a
+        echo w
+        ) | fdisk {{ storage_device }}
+        EOF
+        chmod +x /tmp/parted.txt
+        /tmp/parted.txt
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Add 2nd partition on the rest of the disk
+      parted:
+        device: "{{ storage_device }}"
+        number: 2
+        state: present
+        part_start: "{{ first_partition_size * 1024 + 1 }}MiB"
+        part_end: "100%"
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Format the 2nd partition on {{ storage_device }}
+      filesystem:
+        fstype: xfs
+        dev: "{{ storage_device }}2"
+      when: root_partition_size.stdout | int > first_partition_size
+
+    - name: Update the system
+      become: yes
+      apt:
+        update_cache: yes
+        upgrade: yes
+        cache_valid_time: 3600
+        force_apt_get: yes
+        autoremove: yes
+        autoclean: yes
+
+    - name: Set the timezone
+      become: yes
+      timezone:
+        name: "{{ timezone }}"
+
+    - name: Set the hostname
+      become: yes
+      hostname:
+        name: "{{ inventory_hostname }}.{{ domain }}"
+
+    - name: Add local IP address of all hosts to all hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {% for host in groups['all'] %}
+          {{ hostvars[host]['local_ip'] }} {{ hostvars[host]['inventory_hostname'] }}.{{ domain }}
+          {% endfor %}
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Manually stop and disable docker service
+      shell: |
+        systemctl stop docker
+        systemctl disable docker
+
+    - name:  Install glusterfs-server
+      apt:
+        name: glusterfs-server
+        state: latest
+        update_cache: false
+
+    - name: Ensure glusterd is started and enabled
+      service:
+        name: glusterd
+        state: started
+        enabled: yes
+
+    - name: Create a directory for GlusterFS
+      file:
+        path: /glusterfs
+        state: directory
+
+    - name: Mount the 2nd partition on /glusterfs
+      mount:
+        path: /glusterfs
+        src: "{{ storage_device }}2"
+        fstype: xfs
+        opts: defaults
+        state: mounted
+
+    - name: Add volume mount to /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ storage_device }}2 /glusterfs xfs defaults 0 0"
+
+    - name: Create a trusted storage pool
+      shell: |
+        {% for host in groups['all'] %}
+        gluster peer probe {{ hostvars[host]['inventory_hostname'] }}.{{ domain }}
+        {% endfor %}
+      when: inventory_hostname == groups['all'][0]
+
+    - name: Create a brick directory on /glusterfs
+      file:
+        path: /glusterfs/brick1
+        state: directory
+
+    - name: Create a volume named brick1 with replica 3
+      gluster_volume:
+        state: present
+        name: brick1
+        bricks: "/glusterfs/brick1"
+        cluster:
+          - "{{ groups['all'][0] }}.{{ domain }}"
+          - "{{ groups['all'][1] }}.{{ domain }}"
+          - "{{ groups['all'][2] }}.{{ domain }}"
+        force: yes
+      when: inventory_hostname == groups['all'][0]
+
+    - name: Mount the volume
+      mount:
+        path: /var/lib/docker/volumes
+        src: localhost:/brick1
+        fstype: glusterfs
+        opts: defaults,_netdev
+        state: mounted
+
+    - name: Add volume mount to /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "localhost:/brick1 /var/lib/docker/volumes glusterfs defaults,_netdev 0 0"
+        state: present
+
+    - name: Move Docker volumes metadata file to /root
+      shell: |
+        if [[ ! -f /root/.docker/metadata.db ]]; then
+          mkdir -p /root/.docker
+          rm -fr /var/lib/docker/volumes/metadata.db
+          ln -s /root/.docker/metadata.db /var/lib/docker/volumes/metadata.db
+        fi
+
+    - name: Start docker service
+      service:
+        name: docker
+        state: started
+        enabled: no
+
+    - name: Configure firewall to allow all traffic in local network
+      shell: |
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow from {{ local_network }} to any
+        ufw allow from any to any port 22 proto tcp
+        ufw --force enable

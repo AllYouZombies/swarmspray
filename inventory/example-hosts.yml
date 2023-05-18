@@ -1,0 +1,26 @@
+all:
+  hosts:
+    manager-1:
+      # external IP address of the 1st manager node
+      ansible_host: 1.2.3.4
+      ansible_user: root
+      # internal IP address of the 1st manager node
+      local_ip: 172.16.16.1
+    manager-2:
+      # external IP address of the 2nd manager node
+      ansible_host: 2.3.4.5
+      ansible_user: root
+      # internal IP address of the 2nd manager node
+      local_ip: 172.16.16.2
+    manager-3:
+      # external IP address of the 3rd manager node
+      ansible_host: 3.4.5.6
+      ansible_user: root
+      # internal IP address of the 3rd manager node
+      local_ip: 172.16.16.3
+  children:
+    managers:
+      hosts:
+        manager-1:
+        manager-2:
+        manager-3:
